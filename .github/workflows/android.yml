@@ -1,0 +1,142 @@
+name: Android
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'backend/README.md'
+      - '**/*.md'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One run per branch/PR; a new push cancels the in-flight run.
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # AGP 8.7.3 runs on JDK 17 and 21. Pin the floor (17) for reproducibility;
+  # a second matrix entry for 21 is not needed until a dependency requires it.
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.11.1'
+
+jobs:
+  build:
+    name: Assemble, test, lint (JDK ${{ env.JAVA_VERSION }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # The repository does not commit a Gradle wrapper yet (see CONTRIBUTING.md
+      # "Known gaps"). setup-gradle provisions the pinned Gradle version and
+      # caches ~/.gradle keyed by the version catalog and build scripts.
+      - name: Set up Gradle + cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: false
+
+      - name: Assemble debug APK
+        run: gradle :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Unit tests (pure domain + crypto)
+        run: |
+          gradle :core:model:test :core:crypto:test --stacktrace --no-daemon
+
+      - name: Unit tests (Android libraries)
+        run: |
+          gradle :core:data:testDebugUnitTest --stacktrace --no-daemon
+
+      - name: Lint
+        run: gradle :app:lintDebug --stacktrace --no-daemon
+
+      - name: Upload debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fieldwright-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fieldwright-lint
+          path: |
+            app/build/reports/lint-results-debug.html
+            app/build/reports/lint-results-debug.xml
+            **/build/reports/tests/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fieldwright-test-reports
+          path: '**/build/reports/tests/**'
+          if-no-files-found: warn
+          retention-days: 14
+
+  contract:
+    name: Backend contract sanity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The mock server is zero-dependency, so the only gate here is that it
+      # parses and boots. Full endpoint checks are run locally per backend/README.md.
+      - name: Syntax check mock server
+        run: node --check backend/mock-server.mjs
+
+      - name: Boot smoke test
+        run: |
+          node backend/mock-server.mjs --port 8787 &
+          SERVER_PID=$!
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8787/healthz > /dev/null; then
+              echo "mock server healthy"
+              break
+            fi
+            sleep 0.25
+          done
+          curl -fsS http://127.0.0.1:8787/healthz | head -c 400
+          kill "$SERVER_PID"
+
+      - name: Validate OpenAPI is parseable YAML
+        run: |
+          python3 - <<'PY'
+          import sys
+          try:
+              import yaml
+          except ImportError:
+              print('PyYAML not available; skipping YAML parse (structural check is run locally)')
+              sys.exit(0)
+          with open('docs/api/fieldwright.openapi.yaml', 'r', encoding='utf-8') as f:
+              doc = yaml.safe_load(f)
+          assert doc['openapi'] == '3.1.0', 'OpenAPI version must be 3.1.0'
+          assert doc['paths'], 'no paths'
+          print(f"OpenAPI ok: {len(doc['paths'])} paths")
+          PY
